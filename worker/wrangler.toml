@@ -1,0 +1,9 @@
+name = "dashmark-sync"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "dashmark-sync"
+# 执行 `npx wrangler d1 create dashmark-sync` 后填入返回的 database_id
+database_id = "00000000-0000-0000-0000-000000000000"
