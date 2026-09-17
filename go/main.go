@@ -26,6 +26,15 @@ import (
 
 const maxBody = 1 << 20 // 1 MiB
 
+// ==================== 惰性清理（垃圾回收） ====================
+
+const (
+	cleanInterval    = 24 * time.Hour      // 清理冷却：24h 内不重复清理，减少写消耗
+	expireAfter      = 30 * 24 * time.Hour // 过期阈值：1 个月未访问即删除
+	maxRows          = 50                  // 最大保留条数，超出淘汰最久未访问
+	accessRefreshGap = 20 * time.Hour      // 访问刷新冷却：20h 内重复读取不更新 last_accessed
+)
+
 // ==================== 内存限流（尽力而为） ====================
 
 const (
@@ -87,31 +96,95 @@ func openStore(path string) (*store, error) {
 	}
 	// SQLite 单写者：限制连接数，进一步压低内存占用
 	db.SetMaxOpenConns(1)
-	schema := `CREATE TABLE IF NOT EXISTS sync_data (
-		id           TEXT PRIMARY KEY,
-		verifier     TEXT NOT NULL,
-		payload      BLOB NOT NULL,
-		payload_hash TEXT NOT NULL,
-		updated_at   INTEGER NOT NULL
-	);`
+	schema := `
+	CREATE TABLE IF NOT EXISTS sync_data (
+		id            TEXT PRIMARY KEY,
+		verifier      TEXT NOT NULL,
+		payload       BLOB NOT NULL,
+		payload_hash  TEXT NOT NULL,
+		updated_at    INTEGER NOT NULL,
+		last_accessed INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE TABLE IF NOT EXISTS job_meta (
+		key           TEXT PRIMARY KEY,
+		last_clean_at INTEGER NOT NULL
+	);
+	INSERT OR IGNORE INTO job_meta(key, last_clean_at) VALUES('asset_clean', 0);`
 	if _, err := db.Exec(schema); err != nil {
+		return nil, err
+	}
+	// 老库迁移：补 last_accessed 列并用 updated_at 回填，避免存量数据被误判过期
+	if _, err := db.Exec(
+		`ALTER TABLE sync_data ADD COLUMN last_accessed INTEGER NOT NULL DEFAULT 0`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return nil, err
+		}
+	}
+	if _, err := db.Exec(
+		`UPDATE sync_data SET last_accessed = updated_at WHERE last_accessed = 0`); err != nil {
 		return nil, err
 	}
 	return &store{db: db}, nil
 }
 
+// lazyClean 惰性清理：每次请求进入时尝试执行，24h 冷却期内直接跳过。
+// 任何失败都不影响业务请求。
+func (s *store) lazyClean() {
+	var lastClean int64
+	err := s.db.QueryRow(`SELECT last_clean_at FROM job_meta WHERE key = 'asset_clean'`).Scan(&lastClean)
+	if err != nil {
+		return // 表或行异常，下次请求再试
+	}
+	now := time.Now()
+	if now.UnixMilli()-lastClean < cleanInterval.Milliseconds() {
+		return // 冷却期内，跳过
+	}
+	func() {
+		defer func() { _ = recover() }()
+		tx, err := s.db.Begin()
+		if err != nil {
+			return
+		}
+		defer tx.Rollback() // 提交后 defer 的 Rollback 会静默失败，仅错误路径生效，无副作用
+		// ① 删除超过 1 个月未访问的记录
+		if _, err := tx.Exec(`DELETE FROM sync_data WHERE last_accessed < ?`,
+			now.Add(-expireAfter).UnixMilli()); err != nil {
+			return
+		}
+		// ② 记录总数超过上限时，淘汰最久未访问的条目
+		if _, err := tx.Exec(`DELETE FROM sync_data WHERE id NOT IN
+			(SELECT id FROM sync_data ORDER BY last_accessed DESC LIMIT ?)`, maxRows); err != nil {
+			return
+		}
+		if _, err := tx.Exec(`UPDATE job_meta SET last_clean_at = ? WHERE key = 'asset_clean'`,
+			now.UnixMilli()); err != nil {
+			return
+		}
+		_ = tx.Commit()
+	}()
+}
+
+// touchAccess 访问时间惰性更新：20h 内重复读取不写库，减少写消耗
+func (s *store) touchAccess(id string, lastAccessed int64) {
+	if time.Now().UnixMilli()-lastAccessed <= accessRefreshGap.Milliseconds() {
+		return
+	}
+	_, _ = s.db.Exec(`UPDATE sync_data SET last_accessed = ? WHERE id = ?`, time.Now().UnixMilli(), id)
+}
+
 type row struct {
-	verifier    string
-	payload     []byte
-	payloadHash string
-	updatedAt   int64
+	verifier     string
+	payload      []byte
+	payloadHash  string
+	updatedAt    int64
+	lastAccessed int64
 }
 
 func (s *store) get(id string) (*row, error) {
 	var r row
 	err := s.db.QueryRow(
-		`SELECT verifier, payload, payload_hash, updated_at FROM sync_data WHERE id = ?`, id,
-	).Scan(&r.verifier, &r.payload, &r.payloadHash, &r.updatedAt)
+		`SELECT verifier, payload, payload_hash, updated_at, last_accessed FROM sync_data WHERE id = ?`, id,
+	).Scan(&r.verifier, &r.payload, &r.payloadHash, &r.updatedAt, &r.lastAccessed)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -130,14 +203,15 @@ func (s *store) getMeta(id string) (int64, error) {
 func (s *store) put(id, verifier string, payload []byte, payloadHash string) (int64, error) {
 	now := time.Now().UnixMilli()
 	_, err := s.db.Exec(
-		`INSERT INTO sync_data (id, verifier, payload, payload_hash, updated_at)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO sync_data (id, verifier, payload, payload_hash, updated_at, last_accessed)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   verifier = excluded.verifier,
 		   payload = excluded.payload,
 		   payload_hash = excluded.payload_hash,
-		   updated_at = excluded.updated_at`,
-		id, verifier, payload, payloadHash, now,
+		   updated_at = excluded.updated_at,
+		   last_accessed = excluded.last_accessed`,
+		id, verifier, payload, payloadHash, now, now,
 	)
 	return now, err
 }
@@ -204,6 +278,7 @@ func (s *server) handleSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleMeta(w http.ResponseWriter, r *http.Request, id string) {
+	s.store.lazyClean()
 	updatedAt, err := s.store.getMeta(id)
 	if err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "database error"})
@@ -217,6 +292,7 @@ func (s *server) handleMeta(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id string) {
+	s.store.lazyClean()
 	row, err := s.store.get(id)
 	if err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "database error"})
@@ -230,6 +306,8 @@ func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id string) {
 		s.writeJSON(w, http.StatusForbidden, map[string]string{"error": "verifier mismatch"})
 		return
 	}
+	// 访问时间惰性更新：20h 内重复读取不写库，减少写消耗（异步，不阻塞响应）
+	go s.store.touchAccess(id, row.lastAccessed)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Updated-At", strconv.FormatInt(row.updatedAt, 10))
 	_, _ = w.Write(row.payload)
@@ -258,6 +336,7 @@ func isHex64(s string) bool {
 }
 
 func (s *server) handlePut(w http.ResponseWriter, r *http.Request, id string) {
+	s.store.lazyClean()
 	verifier := r.Header.Get("X-Dashmark-Verifier")
 	if id == "" || verifier == "" {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing id or verifier"})

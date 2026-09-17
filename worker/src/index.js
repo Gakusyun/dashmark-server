@@ -13,6 +13,61 @@ const RATE_WRITE = 10;
 /** @type {Map<string, { count: number, reset: number }>} */
 const rateBuckets = new Map();
 
+// ==================== 惰性清理（垃圾回收） ====================
+
+const CLEAN_INTERVAL_MS = 24 * 3600_000; // 清理冷却：24h 内不重复清理，减少 D1 写消耗
+const EXPIRE_MS = 30 * 24 * 3600_000; // 过期阈值：1 个月未访问即删除
+const MAX_ROWS = 50; // 最大保留条数，超出淘汰最久未访问
+const ACCESS_REFRESH_MS = 20 * 3600_000; // 访问刷新冷却：20h 内重复读取不更新 last_accessed
+
+// 每个隔离实例只尝试一次迁移（老库补 last_accessed 列并回填）
+let schemaReady = false;
+async function ensureSchema(db) {
+  if (schemaReady) return;
+  schemaReady = true;
+  try {
+    await db.prepare('SELECT last_accessed FROM sync_data LIMIT 1').first();
+  } catch {
+    try {
+      await db.batch([
+        db.prepare('ALTER TABLE sync_data ADD COLUMN last_accessed INTEGER NOT NULL DEFAULT 0'),
+        db.prepare('UPDATE sync_data SET last_accessed = updated_at WHERE last_accessed = 0'),
+      ]);
+    } catch {
+      /* 并发迁移或已存在，忽略 */
+    }
+  }
+}
+
+/**
+ * 惰性清理：每次请求进入时尝试执行，24h 冷却期内直接跳过。
+ * 任何失败都不影响业务请求。
+ * @param {D1Database} db
+ */
+async function lazyClean(db) {
+  try {
+    await ensureSchema(db);
+    const now = Date.now();
+    const meta = await db.prepare("SELECT last_clean_at FROM job_meta WHERE key = 'asset_clean'").first();
+    if (!meta) {
+      await db.prepare("INSERT OR IGNORE INTO job_meta(key, last_clean_at) VALUES('asset_clean', 0)").run();
+    } else if (now - meta.last_clean_at < CLEAN_INTERVAL_MS) {
+      return; // 冷却期内，跳过
+    }
+    await db.batch([
+      // ① 删除超过 1 个月未访问的记录
+      db.prepare('DELETE FROM sync_data WHERE last_accessed < ?').bind(now - EXPIRE_MS),
+      // ② 记录总数超过上限时，淘汰最久未访问的条目
+      db.prepare(
+        'DELETE FROM sync_data WHERE id NOT IN (SELECT id FROM sync_data ORDER BY last_accessed DESC LIMIT ?)'
+      ).bind(MAX_ROWS),
+      db.prepare("UPDATE job_meta SET last_clean_at = ? WHERE key = 'asset_clean'").bind(now),
+    ]);
+  } catch {
+    /* 清理失败静默忽略，下次请求再试 */
+  }
+}
+
 function rateLimit(ip, isWrite) {
   const now = Date.now();
   const entry = rateBuckets.get(ip);
@@ -52,6 +107,7 @@ export default {
     // ---------- GET /sync/:id/meta ----------
     if (isMeta && request.method === 'GET') {
       if (!rateLimit(ip, false)) return json({ error: 'rate limited' }, 429);
+      lazyClean(env.DB); // 不 await，不阻塞响应
       const row = await env.DB.prepare('SELECT updated_at FROM sync_data WHERE id = ?')
         .bind(id)
         .first();
@@ -62,14 +118,19 @@ export default {
     // ---------- GET /sync/:id ----------
     if (request.method === 'GET') {
       if (!rateLimit(ip, false)) return json({ error: 'rate limited' }, 429);
+      lazyClean(env.DB); // 不 await，不阻塞响应
       const row = await env.DB.prepare(
-        'SELECT verifier, payload, updated_at FROM sync_data WHERE id = ?'
+        'SELECT verifier, payload, updated_at, last_accessed FROM sync_data WHERE id = ?'
       )
         .bind(id)
         .first();
       if (!row) return json({ error: 'not found' }, 404);
       const verifier = request.headers.get('X-Dashmark-Verifier') || '';
       if (row.verifier !== verifier) return json({ error: 'verifier mismatch' }, 403);
+      // 访问时间惰性更新：20h 内重复读取不写库，减少 D1 写消耗
+      if (Date.now() - row.last_accessed > ACCESS_REFRESH_MS) {
+        env.DB.prepare('UPDATE sync_data SET last_accessed = ? WHERE id = ?').bind(Date.now(), id).run();
+      }
       return new Response(row.payload, {
         status: 200,
         headers: {
@@ -82,6 +143,7 @@ export default {
     // ---------- PUT /sync/:id ----------
     if (request.method === 'PUT') {
       if (!rateLimit(ip, true)) return json({ error: 'rate limited' }, 429);
+      lazyClean(env.DB); // 不 await，不阻塞响应
       const verifier = request.headers.get('X-Dashmark-Verifier') || '';
       if (!id || !verifier) return json({ error: 'missing id or verifier' }, 400);
 
@@ -114,15 +176,16 @@ export default {
 
       const now = Date.now();
       await env.DB.prepare(
-        `INSERT INTO sync_data (id, verifier, payload, payload_hash, updated_at)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO sync_data (id, verifier, payload, payload_hash, updated_at, last_accessed)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            verifier = excluded.verifier,
            payload = excluded.payload,
            payload_hash = excluded.payload_hash,
-           updated_at = excluded.updated_at`
+           updated_at = excluded.updated_at,
+           last_accessed = excluded.last_accessed`
       )
-        .bind(id, verifier, new Uint8Array(body), payloadHash, now)
+        .bind(id, verifier, new Uint8Array(body), payloadHash, now, now)
         .run();
 
       return json({ updatedAt: now });

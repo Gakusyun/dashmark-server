@@ -15,6 +15,8 @@
 |---|---|---|
 | 前端构建 | `VITE_SYNC_SERVER` | 官方同步服务器地址，注入后替代前端内置默认值 |
 | `worker/deploy.sh` | `D1_DATABASE_ID` | D1 数据库 ID（必需） |
+
+同步服务器内置惰性清理（过期删除 + 50 条上限 + 读写冷却），详见下文「数据生命周期」。
 | `worker/deploy.sh` | `D1_DATABASE_NAME` / `WORKER_NAME` | 数据库名 / Worker 名（可选） |
 
 ## 加密模型
@@ -33,13 +35,30 @@
 
 ```sql
 CREATE TABLE IF NOT EXISTS sync_data (
-  id           TEXT PRIMARY KEY,   -- 同步 ID
-  verifier     TEXT NOT NULL,      -- PBKDF2 口令校验值（十六进制）
-  payload      BLOB NOT NULL,      -- 加密后的 gzip 数据
-  payload_hash TEXT NOT NULL,      -- payload 的 SHA-256（十六进制），内容一致时不写入
-  updated_at   INTEGER NOT NULL    -- 最后修改时间（Unix 毫秒）
+  id            TEXT PRIMARY KEY,   -- 同步 ID
+  verifier      TEXT NOT NULL,      -- PBKDF2 口令校验值（十六进制）
+  payload       BLOB NOT NULL,      -- 加密后的 gzip 数据
+  payload_hash  TEXT NOT NULL,      -- payload 的 SHA-256（十六进制），内容一致时不写入
+  updated_at    INTEGER NOT NULL,   -- 最后修改时间（Unix 毫秒）
+  last_accessed INTEGER NOT NULL DEFAULT 0  -- 最后访问时间（Unix 毫秒），惰性清理依据
+);
+
+CREATE TABLE IF NOT EXISTS job_meta (
+  key           TEXT PRIMARY KEY,
+  last_clean_at INTEGER NOT NULL     -- 惰性清理上次执行时间
 );
 ```
+
+## 数据生命周期（惰性清理）
+
+无定时任务，每次接口请求进入时尝试触发清理（失败静默忽略，不影响业务）：
+
+- **清理冷却**：距上次清理不足 24 小时则跳过，避免频繁删除消耗 D1 写额度；
+- **过期删除**：删除 `last_accessed` 超过 **1 个月** 的记录；
+- **数量上限**：总记录数超过 **50 条** 时，淘汰最久未访问的条目；
+- **访问刷新**：读取成功且距上次访问超过 **20 小时** 才更新 `last_accessed`（20 小时内重复读取不写库）；修改内容（PUT）时强制刷新。
+
+风险说明：若服务长期无任何请求，过期记录会留在库内；但单条仅 KB 级、总量远低于 D1 免费 5GB 上限，不会产生费用，下次任意请求即一次性清完。
 
 ## HTTP API
 
