@@ -1,0 +1,28 @@
+# Go
+go/dashmark-server
+go/main
+*.exe
+*.test
+*.out
+
+# Node / wrangler
+node_modules/
+worker/.wrangler/
+wrangler.toml.bak
+*.dev.vars
+
+# 部署产物 / 环境
+.env
+.env.*
+
+# 数据库（本地测试）
+*.db
+*.sqlite
+*.sqlite3
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
