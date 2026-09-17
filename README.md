@@ -9,6 +9,14 @@
 | `worker/` | Cloudflare Workers | D1（SQLite） | 官方公用部署 / 一键 fork 自部署 |
 | `go/` | Go（单二进制） | SQLite（纯 Go 驱动，无 CGO） | 自有云服务器自部署，内存占用极低 |
 
+### 相关环境变量
+
+| 位置 | 变量 | 说明 |
+|---|---|---|
+| 前端构建 | `VITE_SYNC_SERVER` | 官方同步服务器地址，注入后替代前端内置默认值 |
+| `worker/deploy.sh` | `D1_DATABASE_ID` | D1 数据库 ID（必需） |
+| `worker/deploy.sh` | `D1_DATABASE_NAME` / `WORKER_NAME` | 数据库名 / Worker 名（可选） |
+
 ## 加密模型
 
 客户端（浏览器）在本地完成全部加密：
@@ -72,10 +80,12 @@ CREATE TABLE IF NOT EXISTS sync_data (
 
 ```bash
 cd worker
-npx wrangler d1 create dashmark-sync   # 把返回的 database_id 填入 wrangler.toml
-npx wrangler d1 execute dashmark-sync --remote --file=./schema.sql
-npx wrangler deploy
+chmod +x deploy.sh
+npx wrangler d1 create dashmark-sync   # 复制返回的 database_id
+D1_DATABASE_ID=<database_id> ./deploy.sh
 ```
+
+可选环境变量：`D1_DATABASE_NAME`（默认 `dashmark-sync`）、`WORKER_NAME`（默认 `dashmark-sync`）、`SKIP_MIGRATION=1`（跳过建表）。
 
 ### Go
 
